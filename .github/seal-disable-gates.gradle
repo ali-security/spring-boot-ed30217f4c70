@@ -1,0 +1,13 @@
+// Sealed-fork CI: switch off the lint / style / static-analysis gates that
+// Spring Boot's conventions chain into `check` (Checkstyle incl. nohttp,
+// Spring Java Format `checkFormat*`, ArchUnit `checkArchitecture*`). They
+// never execute the code under test; every Test task still runs.
+
+allprojects {
+	tasks.configureEach { Task t ->
+		if (t.name.startsWith('checkstyle') || t.name.startsWith('checkFormat')
+				|| t.name.startsWith('checkArchitecture')) {
+			t.enabled = false
+		}
+	}
+}

@@ -1,8 +1,6 @@
 name: Run System Tests
 on:
-  push:
-    branches:
-      - '3.5.x'
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

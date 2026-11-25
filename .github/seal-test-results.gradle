@@ -1,0 +1,166 @@
+// Sealed-fork CI: print per-task test totals and every skipped test with its
+// reason. Spring Boot's build configures no test logging, so without this the
+// log never states how many tests ran. Test results are never served from the
+// (remote) build cache, so every reported test really executed in this run.
+
+def annotationPattern = ~/^\s*@(Disabled\w*|Enabled\w*|Ignore\w*|ClassPathExclusions|Assume\w*|ForkedClassPath)\b.*/
+def assumePattern = ~/.*\b(assume\w*|Assumptions\.\w+)\s*\(.*/
+
+def sourceIndex = { Project project ->
+	def files = [:]
+	project.rootProject.allprojects.each { p ->
+		['test', 'testFixtures', 'intTest', 'main'].each { set ->
+			['java', 'kotlin'].each { lang ->
+				def dir = new File(p.projectDir, "src/${set}/${lang}")
+				if (dir.isDirectory()) {
+					dir.eachFileRecurse { f ->
+						if (f.name.endsWith('.java') || f.name.endsWith('.kt')) {
+							def rel = dir.toPath().relativize(f.toPath()).toString().replace('\\', '/')
+							files.putIfAbsent(rel.replaceAll(/\.(java|kt)$/, '').replace('/', '.'), f)
+						}
+					}
+				}
+			}
+		}
+	}
+	files
+}
+
+def classAnnotations = { List<String> lines, String simpleName ->
+	def result = []
+	def idx = lines.findIndexOf { it =~ /\b(class|interface)\s+${java.util.regex.Pattern.quote(simpleName)}\b/ }
+	if (idx >= 0) {
+		for (int i = idx - 1; i >= 0 && i >= idx - 12; i--) {
+			def l = lines[i].trim()
+			if (l.startsWith('@')) {
+				if (l ==~ annotationPattern) {
+					result << l
+				}
+			}
+			else if (!(l.startsWith('*') || l.startsWith('/') || l.isEmpty())) {
+				break
+			}
+		}
+	}
+	result
+}
+
+def methodReason
+methodReason = { Map index, String className, String method, int depth ->
+	if (depth > 5) {
+		return []
+	}
+	def outer = className.replaceAll(/\$.*/, '')
+	def nestedName = className.contains('$') ? className.substring(className.lastIndexOf('$') + 1) : null
+	def file = index[outer]
+	if (file == null) {
+		return []
+	}
+	def lines = file.readLines('UTF-8')
+	def reasons = []
+	reasons.addAll(classAnnotations(lines, outer.substring(outer.lastIndexOf('.') + 1)))
+	if (nestedName != null) {
+		reasons.addAll(classAnnotations(lines, nestedName))
+	}
+	def idx = lines.findIndexOf { it =~ /\b(void|fun)\s+${java.util.regex.Pattern.quote(method)}\s*\(/ }
+	if (idx >= 0) {
+		if (lines[idx] ==~ /.*@(Disabled|Enabled|Ignore)\w*.*/) {
+			reasons << lines[idx].trim()
+		}
+		for (int i = idx - 1; i >= 0 && i >= idx - 8; i--) {
+			def l = lines[i].trim()
+			if (l ==~ annotationPattern) {
+				reasons << l
+			}
+			if (l.endsWith('}') || l.endsWith(';')) {
+				break
+			}
+		}
+		int braces = 0
+		boolean opened = false
+		for (int i = idx; i < lines.size(); i++) {
+			def l = lines[i]
+			if (l ==~ assumePattern) {
+				reasons << l.trim()
+			}
+			braces += l.count('{') - l.count('}')
+			if (l.contains('{')) {
+				opened = true
+			}
+			if (opened && braces <= 0) {
+				break
+			}
+		}
+		// assumptions in lifecycle methods
+		lines.eachWithIndex { l, i ->
+			if (l ==~ /\s*@(BeforeEach|BeforeAll|Before|BeforeClass)\b.*/) {
+				for (int j = i + 1; j < Math.min(lines.size(), i + 15); j++) {
+					if (lines[j] ==~ assumePattern) {
+						reasons << ('lifecycle: ' + lines[j].trim())
+					}
+				}
+			}
+		}
+	}
+	else {
+		def simple = outer.substring(outer.lastIndexOf('.') + 1)
+		def ext = (lines.join('\n') =~ /(?s)\bclass\s+${java.util.regex.Pattern.quote(simple)}\b[^{]*?\bextends\s+(\w+)/)
+		if (ext.find()) {
+			def parent = ext.group(1)
+			def imp = lines.find { it ==~ /\s*import\s+[\w.]+\.${parent}\s*;\s*/ }
+			def parentFqcn = imp != null ? imp.trim().replaceAll(/^import\s+/, '').replaceAll(/\s*;\s*$/, '')
+					: outer.substring(0, outer.lastIndexOf('.') + 1) + parent
+			def inherited = methodReason(index, parentFqcn, method, depth + 1)
+			reasons.addAll(inherited.collect { "(inherited from ${parent}) " + it })
+		}
+	}
+	reasons.unique()
+}
+
+allprojects {
+	tasks.withType(Test).configureEach { Test t ->
+		t.outputs.cacheIf { false }
+		t.outputs.upToDateWhen { false }
+		def skipped = []
+		t.afterTest { TestDescriptor desc, TestResult result ->
+			if (result.resultType == TestResult.ResultType.SKIPPED) {
+				def method = desc.name
+				if (method.startsWith('[') && desc.parent != null) {
+					method = desc.parent.name
+				}
+				method = method.replaceAll(/\(.*$/, '')
+				def msg = result.exception != null ? result.exception.toString().readLines().find() : null
+				skipped << [desc.className ?: desc.name, method, msg]
+			}
+			if (result.resultType == TestResult.ResultType.FAILURE) {
+				t.logger.lifecycle("FAILED TEST ${desc.className} > ${desc.name}: ${result.exception}")
+			}
+		}
+		t.afterSuite { TestDescriptor desc, TestResult result ->
+			if (desc.parent == null) {
+				t.logger.lifecycle("TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}")
+				if (!skipped.isEmpty()) {
+					def index = sourceIndex(t.project)
+					skipped.each { entry ->
+						def (cls, m, msg) = entry
+						def reasons = []
+						try {
+							reasons = methodReason(index, cls, m, 0)
+						}
+						catch (Exception ex) {
+							reasons = ["(source lookup failed: ${ex.message})"]
+						}
+						if (msg != null) {
+							reasons << "aborted: ${msg}"
+						}
+						def reason = reasons.isEmpty() ? 'no annotation/assumption found in source; skipped by the JUnit platform condition' : reasons.join(' | ')
+						if (reason.length() > 220) {
+							reason = reason.substring(0, 220) + '...'
+						}
+						t.logger.lifecycle("SKIPPED TEST: ${cls}#${m} (${t.path}) -- reason: ${reason}")
+					}
+				}
+			}
+		}
+	}
+}

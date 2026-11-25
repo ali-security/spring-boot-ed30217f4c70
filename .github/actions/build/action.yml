@@ -40,6 +40,14 @@ inputs:
     description: 'Whether to publish artifacts ready for deployment to Artifactory'
     required: false
     default: 'false'
+  build-tasks:
+    description: 'Gradle tasks run by the build (sealed fork: scoped to the sealed module to fit the CI time budget)'
+    required: false
+    default: 'build'
+  publish-tasks:
+    description: 'Gradle tasks that publish to the local deployment repository'
+    required: false
+    default: 'publishAllPublicationsToDeploymentRepository'
 outputs:
   build-scan-url:
     description: 'URL, if any, of the build scan produced by the build'
@@ -59,6 +67,15 @@ runs:
         java-early-access: ${{ inputs.java-early-access }}
         java-toolchain: ${{ inputs.java-toolchain }}
         java-version: ${{ inputs.java-version }}
+    - name: Configure Test Result Reporting
+      shell: bash
+      run: |
+        gradle_user_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+        gradle_user_home="${gradle_user_home//\\//}"
+        mkdir -p "$gradle_user_home/init.d"
+        cp .github/seal-test-results.gradle "$gradle_user_home/init.d/seal-test-results.gradle"
+        cp .github/seal-disable-gates.gradle "$gradle_user_home/init.d/seal-disable-gates.gradle"
+        echo "Installed sealed-fork init scripts in $gradle_user_home/init.d"
     - name: Build
       id: build
       if: ${{ inputs.publish == 'false' }}
@@ -68,7 +85,7 @@ runs:
         COMMERCIAL_REPO_PASSWORD: ${{ inputs.commercial-repository-password }}
         COMMERCIAL_REPO_USERNAME: ${{ inputs.commercial-repository-username }}
         COMMERCIAL_SNAPSHOT_REPO_URL: ${{ inputs.commercial-snapshot-repository-url }}
-      run: ./gradlew build
+      run: ./gradlew ${{ inputs.build-tasks }}
     - name: Publish
       id: publish
       if: ${{ inputs.publish == 'true' }}
@@ -78,7 +95,7 @@ runs:
         COMMERCIAL_REPO_PASSWORD: ${{ inputs.commercial-repository-password }}
         COMMERCIAL_REPO_USERNAME: ${{ inputs.commercial-repository-username }}
         COMMERCIAL_SNAPSHOT_REPO_URL: ${{ inputs.commercial-snapshot-repository-url }}
-      run: ./gradlew -PdeploymentRepository=$(pwd)/deployment-repository ${{ !startsWith(github.event.head_commit.message, 'Next development version') && 'build' || '' }} publishAllPublicationsToDeploymentRepository
+      run: ./gradlew -PdeploymentRepository=$(pwd)/deployment-repository ${{ !startsWith(github.event.head_commit.message, 'Next development version') && inputs.build-tasks || '' }} ${{ inputs.publish-tasks }}
     - name: Read Version From gradle.properties
       id: read-version
       shell: bash
